@@ -1,0 +1,33 @@
+server:
+  port: ${TXSERVICE_PORT:8082}
+
+spring:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:miniexchange}
+    username: ${POSTGRES_USER:miniexchange}
+    password: ${POSTGRES_PASSWORD:miniexchange}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+
+web3j:
+  client-address: ${GETH_URL:http://localhost:8080}
+
+signer:
+  private-key: ${SIGNER_PRIVATE_KEY}
+
+chain:
+  id: ${CHAIN_ID:560048}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  prometheus:
+    metrics:
+      export:
+        enabled: true
