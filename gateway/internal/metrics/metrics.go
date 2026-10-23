@@ -5,6 +5,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+/*
+同一个指标名不能注册两次，否则会 panic
+*/
+
 var (
 	RequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "gateway",

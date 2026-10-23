@@ -81,7 +81,9 @@ func (h *handler) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	maxBodySize10M := int64(10 * 1024 * 1024)
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize10M))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, -32700, "failed to read request body")
 		return
