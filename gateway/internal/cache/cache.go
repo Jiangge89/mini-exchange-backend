@@ -112,12 +112,81 @@ var blockParamMethods = map[toCacheMethod]struct{}{
 ["0x122A...586d", {"blockHash": "0xa1d5...a317"}]   // 写法 3：对象，按区块哈希 -> can cache for longer time
 ["0x122A...586d", {"blockNumber": "0x3a8b7a"}]      // 写法 4：对象，按区块number
 */
-var needCheckObjByMethod = map[toCacheMethod]struct{}{
-	EthGetBalance:          struct{}{},
-	EthGetTransactionCount: struct{}{},
-	EthGetCode:             struct{}{},
-	EthCall:                struct{}{},
-	EthGetStorageAt:        struct{}{},
+var blockParamOptionalMethods = map[toCacheMethod]struct{}{
+	EthGetBalance:          {},
+	EthGetTransactionCount: {},
+	EthGetCode:             {},
+	EthCall:                {},
+	EthGetStorageAt:        {},
+}
+
+type blockRefKind int
+
+const (
+	refNone         blockRefKind = iota
+	refTag                       // earliest, finalized, safe, latest, pending
+	refBlockNum                  // explicit hex block number
+	refBlockHash                 // {blockHash: "0x..."}
+	refDefaultLatest             // block param omitted, defaults to latest
+)
+
+type blockRef struct {
+	kind blockRefKind
+	tag  blockParamVal
+	num  uint64
+}
+
+func resolveBlockRef(method toCacheMethod, params []json.RawMessage) blockRef {
+	paramIdx := blockParamIdxByMethod[method]
+
+	if len(params) < paramIdx {
+		return blockRef{kind: refNone}
+	}
+
+	if len(params) == paramIdx {
+		if _, ok := blockParamOptionalMethods[method]; ok {
+			return blockRef{kind: refDefaultLatest}
+		}
+		return blockRef{kind: refNone}
+	}
+
+	raw := params[paramIdx]
+	paramVal := bytes.TrimSpace(bytes.Trim(raw, `"`))
+
+	tag := blockParamVal(paramVal)
+	switch tag {
+	case Earliest, Finalized, Safe, Latest, Pending:
+		return blockRef{kind: refTag, tag: tag}
+	}
+
+	s := string(paramVal)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		if n, ok := parseBlockNumber(s); ok {
+			return blockRef{kind: refBlockNum, num: n}
+		}
+		return blockRef{kind: refNone}
+	}
+
+	if bytes.HasPrefix(paramVal, []byte("{")) {
+		var obj struct {
+			BlockNumber string `json:"blockNumber"`
+			BlockHash   string `json:"blockHash"`
+		}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return blockRef{kind: refNone}
+		}
+		if obj.BlockHash != "" {
+			return blockRef{kind: refBlockHash}
+		}
+		if obj.BlockNumber != "" {
+			if n, ok := parseBlockNumber(obj.BlockNumber); ok {
+				return blockRef{kind: refBlockNum, num: n}
+			}
+		}
+		return blockRef{kind: refNone}
+	}
+
+	return blockRef{kind: refNone}
 }
 
 // Cache 提供 JSON-RPC 响应的缓存功能，感知区块最终确认状态。
@@ -190,54 +259,31 @@ func New(redisURL string) (Cache, error) {
 
 func (c *redisCache) ShouldCache(method string, params []json.RawMessage) (bool, time.Duration) {
 	methodName := toCacheMethod(method)
+
 	if ttl, ok := cacheTTLByMethod[methodName]; ok {
 		return true, ttl
 	}
-	if _, ok := blockParamMethods[methodName]; ok {
-		paramIdx := blockParamIdxByMethod[methodName]
-		if len(params) < paramIdx {
-			return false, 0
-		}
 
-		if len(params) == paramIdx {
-			if _, needCheckObj := needCheckObjByMethod[methodName]; needCheckObj { // param is omitted
-				return true, ttlByBlockParamVal[Latest]
-			}
-			return false, 0 // illegal
-		}
-
-		paramVal := bytes.TrimSpace(bytes.Trim(params[paramIdx], `"`))
-		if ttl, exist := ttlByBlockParamVal[blockParamVal(paramVal)]; exist {
-			return true, ttl
-		}
-
-		if blockParamVal(paramVal) == Pending {
-			return false, 0
-		}
-
-		if strings.HasPrefix(string(paramVal), "0x") { // block number
-			shouldCache, ttl := getCacheTTLByBlockNumber(string(paramVal))
-			return shouldCache, ttl
-		} else if strings.HasPrefix(string(paramVal), "{") {
-			var obj struct {
-				BlockNumber string `json:"blockNumber"`
-				BlockHash   string `json:"blockHash"`
-			}
-			if err := json.Unmarshal(paramVal, &obj); err != nil {
-				return false, 0
-			}
-			if obj.BlockNumber != "" {
-				shouldCache, ttl := getCacheTTLByBlockNumber(obj.BlockNumber)
-				return shouldCache, ttl
-			} else if obj.BlockHash != "" {
-				return true, longCacheTTL
-			}
-		}
-
+	if _, ok := blockParamMethods[methodName]; !ok {
 		return false, 0
 	}
 
-	return false, 0
+	ref := resolveBlockRef(methodName, params)
+	switch ref.kind {
+	case refTag:
+		if ttl, ok := ttlByBlockParamVal[ref.tag]; ok {
+			return true, ttl
+		}
+		return false, 0
+	case refBlockNum:
+		return cacheTTLByBlockNum(ref.num)
+	case refBlockHash:
+		return true, longCacheTTL
+	case refDefaultLatest:
+		return true, ttlByBlockParamVal[Latest]
+	default:
+		return false, 0
+	}
 }
 
 func parseBlockNumber(s string) (uint64, bool) {
@@ -251,29 +297,20 @@ func parseBlockNumber(s string) (uint64, bool) {
 	return n, true
 }
 
-func getCacheTTLByBlockNumber(blockNumberStr string) (bool, time.Duration) {
-	blockNumber, ok := parseBlockNumber(blockNumberStr)
-	if !ok {
+func cacheTTLByBlockNum(blockNumber uint64) (bool, time.Duration) {
+	curFinalized := finalizedBlockNumber.Load()
+	if curFinalized == 0 {
 		return false, 0
 	}
 
-	// if <= finalized -> cache longer
-	curFinalizedBlockNumber := finalizedBlockNumber.Load()
-	if curFinalizedBlockNumber == 0 { // no local finalized blockNumber yet
-		return false, 0
-	}
-
-	if blockNumber <= curFinalizedBlockNumber {
+	if blockNumber <= curFinalized {
 		return true, longCacheTTL
 	}
 
-	// if > finalized && <= latest -> may be modified by reorg
-	curLatestBlockNumber := latestBlockNumber.Load()
-	if blockNumber <= curLatestBlockNumber {
+	if blockNumber <= latestBlockNumber.Load() {
 		return true, shortCacheTTL
 	}
 
-	// if > latest -> no cache
 	return false, 0
 }
 
