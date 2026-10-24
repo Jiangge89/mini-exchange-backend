@@ -15,6 +15,12 @@ var (
 		Name:      "requests_total",
 		Help:      "Total JSON-RPC requests by method.",
 	}, []string{"method"})
+	
+	RequestsErrorTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "gateway",
+		Name:      "requests_error_total",
+		Help:      "Total JSON-RPC error requests by method and error code.",
+	}, []string{"method", "error"})
 
 	RequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "gateway",
@@ -40,6 +46,12 @@ var (
 		Name:      "cache_misses_total",
 		Help:      "Total cache misses.",
 	})
+
+	CacheErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "gateway",
+		Name:      "cache_errors_total",
+		Help:      "Total cache errors.",
+	}, []string{"method"})
 
 	UpstreamHealth = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "gateway",

@@ -35,7 +35,11 @@ func main() {
 	pool := upstream.NewPool(entries)
 	selector := upstream.NewSelector(pool)
 	healthChecker := upstream.NewHealthChecker(pool)
-	cacheStore := cache.New(cfg.RedisURL)
+	cacheStore, err := cache.New(cfg.RedisURL) // critical dependency
+	if err != nil {
+		slog.Error("failed to create redis cache", "error", err)
+		os.Exit(1)
+	}
 	limiter := ratelimit.New(cfg.RedisURL)
 	metrics.Register()
 

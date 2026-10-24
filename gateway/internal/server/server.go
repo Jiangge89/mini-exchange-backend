@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -40,6 +41,7 @@ func New(cfg *config.Config, selector upstream.Selector, cache cache.Cache, limi
 		selector: selector,
 		cache:    cache,
 		limiter:  limiter,
+		chainID:  cfg.ChainID,
 	}
 	mux.HandleFunc("POST /", h.handleRPC)
 	mux.Handle("GET /metrics", promhttp.Handler())
@@ -63,6 +65,7 @@ type handler struct {
 	selector upstream.Selector
 	cache    cache.Cache
 	limiter  ratelimit.RateLimiter
+	chainID  uint64
 }
 
 func (h *handler) handleRPC(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +116,7 @@ func (h *handler) handleSingle(w http.ResponseWriter, r *http.Request, body []by
 	json.NewEncoder(w).Encode(resp)
 }
 
+// TODO need to set batch size limit?
 func (h *handler) handleBatch(w http.ResponseWriter, r *http.Request, body []byte, start time.Time) {
 	var reqs []JSONRPCRequest
 	if err := json.Unmarshal(body, &reqs); err != nil {
@@ -121,7 +125,7 @@ func (h *handler) handleBatch(w http.ResponseWriter, r *http.Request, body []byt
 	}
 
 	responses := make([]JSONRPCResponse, len(reqs))
-	for i, req := range reqs {
+	for i, req := range reqs { // TODO change to processRequest concurrently
 		responses[i] = h.processRequest(r, &req)
 		metrics.RequestsTotal.WithLabelValues(req.Method).Inc()
 	}
@@ -136,27 +140,42 @@ func (h *handler) processRequest(r *http.Request, req *JSONRPCRequest) JSONRPCRe
 
 	shouldCache, ttl := h.cache.ShouldCache(req.Method, req.Params)
 	if shouldCache {
-		cacheKey := cache.BuildKey(req.Method, req.Params)
-		if cached, ok, err := h.cache.Get(ctx, cacheKey); err == nil && ok {
+		cacheKey := cache.BuildKey(h.chainID, req.Method, req.Params)
+		cached, ok, err := h.cache.Get(ctx, cacheKey)
+		if err == nil && ok {
 			metrics.CacheHits.Inc()
 			var resp JSONRPCResponse
 			if err := json.Unmarshal(cached, &resp); err == nil {
 				resp.ID = req.ID
 				return resp
+			} else {
+				slog.Error("failed to unmarshal cache", "error", err)
 			}
+		} else if err == nil {
+			metrics.CacheMisses.Inc()
+		} else {
+			slog.Error("failed to get from cache", "error", err)
+			metrics.CacheErrors.WithLabelValues("get").Inc()
 		}
-		metrics.CacheMisses.Inc()
 
 		resp := h.forwardToUpstream(ctx, req)
-		if resp.Error == nil {
+		if resp.Error == nil && !isNullResult(resp.Result) {
 			if respBytes, err := json.Marshal(resp); err == nil {
-				h.cache.Set(ctx, cacheKey, respBytes, ttl)
+				err = h.cache.Set(ctx, cacheKey, respBytes, ttl)
+				if err != nil {
+					slog.Error("failed to cache response", "error", err)
+					metrics.CacheErrors.WithLabelValues("set").Inc()
+				}
 			}
 		}
 		return resp
 	}
 
 	return h.forwardToUpstream(ctx, req)
+}
+
+func isNullResult(result json.RawMessage) bool {
+	return len(result) == 0 || bytes.Equal(result, []byte("null"))
 }
 
 func (h *handler) forwardToUpstream(ctx interface{ Done() <-chan struct{} }, req *JSONRPCRequest) JSONRPCResponse {

@@ -3,8 +3,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 )
+
+var cfg *Config
+var loadCfgOnce sync.Once
 
 type UpstreamConfig struct {
 	Name string
@@ -15,6 +20,7 @@ type Config struct {
 	Port      string
 	RedisURL  string
 	Upstreams []UpstreamConfig
+	ChainID   uint64
 }
 
 func Load() (*Config, error) {
@@ -37,11 +43,23 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("no upstreams configured; set at least one of GETH_URL, ALCHEMY_HOODI_URL, PUBLIC_RPC_URL")
 	}
 
-	return &Config{
+	chainIDStr := os.Getenv("CHAIN_ID")
+	if chainIDStr == "" {
+		return nil, fmt.Errorf("CHAIN_ID env variable is required")
+	}
+	chainID, err := strconv.ParseUint(chainIDStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse chain_id: %s err: %v", chainIDStr, err)
+	}
+
+	cfg = &Config{
 		Port:      port,
 		RedisURL:  redisURL,
 		Upstreams: upstreams,
-	}, nil
+		ChainID:   chainID,
+	}
+
+	return cfg, nil
 }
 
 func (c *Config) Addr() string {

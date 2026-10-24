@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,18 +95,6 @@ var cacheTTLByMethod = map[toCacheMethod]time.Duration{
 	EthMaxPriorityFeePerGas:              shortCacheTTL,
 }
 
-var blockParamMethods = map[toCacheMethod]struct{}{
-	EthGetBlockByNumber:                    struct{}{},
-	EthGetBlockTransactionCountByNumber:    struct{}{},
-	EthGetTransactionByBlockNumberAndIndex: struct{}{},
-	EthGetBlockReceipts:                    struct{}{},
-	EthGetBalance:                          struct{}{},
-	EthGetTransactionCount:                 struct{}{},
-	EthGetCode:                             struct{}{},
-	EthCall:                                struct{}{},
-	EthGetStorageAt:                        struct{}{},
-}
-
 /*
 ["0x122A...586d", "latest"]                         // 写法 1：标签
 ["0x122A...586d", "0x3a8b7a"]                       // 写法 2：区块号
@@ -123,11 +112,11 @@ var blockParamOptionalMethods = map[toCacheMethod]struct{}{
 type blockRefKind int
 
 const (
-	refNone         blockRefKind = iota
-	refTag                       // earliest, finalized, safe, latest, pending
-	refBlockNum                  // explicit hex block number
-	refBlockHash                 // {blockHash: "0x..."}
-	refDefaultLatest             // block param omitted, defaults to latest
+	refNone          blockRefKind = iota
+	refTag                        // earliest, finalized, safe, latest, pending
+	refBlockNum                   // explicit hex block number
+	refBlockHash                  // {blockHash: "0x..."}
+	refDefaultLatest              // block param omitted, defaults to latest
 )
 
 type blockRef struct {
@@ -264,7 +253,7 @@ func (c *redisCache) ShouldCache(method string, params []json.RawMessage) (bool,
 		return true, ttl
 	}
 
-	if _, ok := blockParamMethods[methodName]; !ok {
+	if _, ok := blockParamIdxByMethod[methodName]; !ok {
 		return false, 0
 	}
 
@@ -333,11 +322,86 @@ func (c *redisCache) InvalidateOnReorg(_ context.Context, _ uint64) error {
 	return errors.New("not implemented")
 }
 
-func BuildKey(method string, params []json.RawMessage) string {
-	h := sha256.New()
-	h.Write([]byte(method))
-	for _, p := range params {
-		h.Write(p)
+func canonicalizeParams(params []json.RawMessage) []json.RawMessage {
+	out := make([]json.RawMessage, len(params))
+	for i, p := range params {
+		out[i] = canonicalizeValue(p)
 	}
-	return fmt.Sprintf("gw:rpc:%x", h.Sum(nil))
+	return out
+}
+
+func canonicalizeValue(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+
+	if len(trimmed) == 0 {
+		return raw
+	}
+
+	switch trimmed[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return raw
+		}
+		s = canonicalizeHex(s)
+		b, _ := json.Marshal(s)
+		return b
+
+	case '{':
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return raw
+		}
+		for k, v := range obj {
+			obj[k] = canonicalizeValue(v)
+		}
+		b, _ := json.Marshal(obj)
+		return b
+
+	case '[':
+		var arr []json.RawMessage
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return raw
+		}
+		for i, v := range arr {
+			arr[i] = canonicalizeValue(v)
+		}
+		b, _ := json.Marshal(arr)
+		return b
+
+	default:
+		b, _ := json.Marshal(json.RawMessage(trimmed))
+		return b
+	}
+}
+
+func canonicalizeHex(s string) string {
+	if !strings.HasPrefix(s, "0x") && !strings.HasPrefix(s, "0X") {
+		return s
+	}
+	hex := strings.ToLower(s[2:])
+	if len(hex) == 40 {
+		return "0x" + hex
+	}
+
+	hex = strings.TrimLeft(hex, "0")
+	if hex == "" {
+		return "0x0"
+	}
+	return "0x" + hex
+}
+
+func BuildKey(chainID uint64, method string, params []json.RawMessage) string {
+	params = canonicalizeParams(params)
+	h := sha256.New()
+	for _, param := range params {
+		h.Write(param)
+		h.Write([]byte{0}) // add delimiter
+	}
+	bs := h.Sum(nil)
+	paramsHashBase64 := base64.RawURLEncoding.EncodeToString(bs)
+
+	key := fmt.Sprintf("gw:rpc:%d:%s:%s", chainID, method, paramsHashBase64)
+
+	return key
 }
