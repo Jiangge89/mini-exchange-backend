@@ -140,7 +140,7 @@ func resolveBlockRef(method toCacheMethod, params []json.RawMessage) blockRef {
 	}
 
 	raw := params[paramIdx]
-	paramVal := bytes.TrimSpace(bytes.Trim(raw, `"`))
+	paramVal := bytes.Trim(bytes.TrimSpace(raw), `"`)
 
 	tag := blockParamVal(paramVal)
 	switch tag {
@@ -352,10 +352,19 @@ func canonicalizeValue(raw json.RawMessage) json.RawMessage {
 		if err := json.Unmarshal(trimmed, &obj); err != nil {
 			return raw
 		}
+		normalized := make(map[string]json.RawMessage, len(obj))
 		for k, v := range obj {
-			obj[k] = canonicalizeValue(v)
+			if byteDataFields[k] {
+				normalized[k] = lowerHexRaw(v)
+			} else {
+				normK := k
+				if strings.HasPrefix(k, "0x") || strings.HasPrefix(k, "0X") {
+					normK = lowerHex(k)
+				}
+				normalized[normK] = canonicalizeValue(v)
+			}
 		}
-		b, _ := json.Marshal(obj)
+		b, _ := json.Marshal(normalized)
 		return b
 
 	case '[':
@@ -373,6 +382,31 @@ func canonicalizeValue(raw json.RawMessage) json.RawMessage {
 		b, _ := json.Marshal(json.RawMessage(trimmed))
 		return b
 	}
+}
+
+var byteDataFields = map[string]bool{
+	"data": true, "input": true, "code": true,
+}
+
+func lowerHexRaw(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return raw
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return raw
+	}
+	s = lowerHex(s)
+	b, _ := json.Marshal(s)
+	return b
+}
+
+func lowerHex(s string) string {
+	if !strings.HasPrefix(s, "0x") && !strings.HasPrefix(s, "0X") {
+		return s
+	}
+	return "0x" + strings.ToLower(s[2:])
 }
 
 func canonicalizeHex(s string) string {
