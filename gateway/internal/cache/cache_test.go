@@ -3,55 +3,300 @@ package cache
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
-func TestShouldCache_SendRawTransaction_NeverCache(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_sendRawTransaction 是写方法，永远不应缓存
-	// 期望 shouldCache == false
+func TestShouldCache(t *testing.T) {
+	// Set known block heights: finalized=100, latest=200
+	finalizedBlockNumber.Store(100)
+	latestBlockNumber.Store(200)
+	t.Cleanup(func() {
+		finalizedBlockNumber.Store(0)
+		latestBlockNumber.Store(0)
+	})
+
+	c := &redisCache{}
+
+	tests := []struct {
+		name      string
+		method    string
+		params    string
+		wantCache bool
+		wantTTL   time.Duration
+	}{
+		// ── Static methods: fixed TTL regardless of params ──
+
+		{"eth_chainId/nil", "eth_chainId", `null`, true, 5 * time.Minute},
+		{"eth_chainId/empty", "eth_chainId", `[]`, true, 5 * time.Minute},
+		{"net_version/nil", "net_version", `null`, true, 5 * time.Minute},
+		{"net_version/empty", "net_version", `[]`, true, 5 * time.Minute},
+		{"eth_blockNumber/nil", "eth_blockNumber", `null`, true, time.Second},
+		{"eth_blockNumber/empty", "eth_blockNumber", `[]`, true, time.Second},
+		{"eth_gasPrice/nil", "eth_gasPrice", `null`, true, time.Second},
+		{"eth_gasPrice/empty", "eth_gasPrice", `[]`, true, time.Second},
+		{"eth_maxPriorityFeePerGas/nil", "eth_maxPriorityFeePerGas", `null`, true, time.Second},
+		{"eth_maxPriorityFeePerGas/empty", "eth_maxPriorityFeePerGas", `[]`, true, time.Second},
+
+		// Block-hash-based methods: always long TTL (hash commits to content)
+		{"eth_getBlockByHash", "eth_getBlockByHash", `["0x0000000000000000000000000000000000000000000000000000000000000001",true]`, true, 5 * time.Minute},
+		{"eth_getBlockTransactionCountByHash", "eth_getBlockTransactionCountByHash", `["0x0000000000000000000000000000000000000000000000000000000000000001"]`, true, 5 * time.Minute},
+		{"eth_getTransactionByBlockHashAndIndex", "eth_getTransactionByBlockHashAndIndex", `["0x0000000000000000000000000000000000000000000000000000000000000001","0x0"]`, true, 5 * time.Minute},
+
+		// ── Block tags on eth_getBlockByNumber ──
+
+		{"getBlockByNumber/earliest", "eth_getBlockByNumber", `["earliest",true]`, true, 5 * time.Minute},
+		{"getBlockByNumber/finalized", "eth_getBlockByNumber", `["finalized",true]`, true, 5 * time.Minute},
+		{"getBlockByNumber/safe", "eth_getBlockByNumber", `["safe",true]`, true, 10 * time.Second},
+		{"getBlockByNumber/latest", "eth_getBlockByNumber", `["latest",true]`, true, time.Second},
+		{"getBlockByNumber/pending", "eth_getBlockByNumber", `["pending",true]`, false, 0},
+
+		// ── Hex block numbers: finalized(100), latest(200) ──
+
+		// 0x50 = 80 ≤ finalized → long TTL
+		{"getBlockByNumber/finalized_num", "eth_getBlockByNumber", `["0x50",true]`, true, 5 * time.Minute},
+		// 0x64 = 100 = finalized boundary → long TTL
+		{"getBlockByNumber/finalized_boundary", "eth_getBlockByNumber", `["0x64",true]`, true, 5 * time.Minute},
+		// 0x65 = 101 = first block after finalized → short TTL
+		{"getBlockByNumber/finalized_plus_one", "eth_getBlockByNumber", `["0x65",true]`, true, time.Second},
+		// 0x96 = 150, between finalized and latest → short TTL
+		{"getBlockByNumber/unfinalized_num", "eth_getBlockByNumber", `["0x96",true]`, true, time.Second},
+		// 0xc8 = 200 = latest boundary → short TTL
+		{"getBlockByNumber/latest_boundary", "eth_getBlockByNumber", `["0xc8",true]`, true, time.Second},
+		// 0xc9 = 201 > latest → no cache
+		{"getBlockByNumber/future_num", "eth_getBlockByNumber", `["0xc9",true]`, false, 0},
+		// genesis
+		{"getBlockByNumber/genesis", "eth_getBlockByNumber", `["0x0",true]`, true, 5 * time.Minute},
+
+		// ── EIP-1898 block objects ──
+
+		{"getBlockReceipts/blockHash_obj", "eth_getBlockReceipts", `[{"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000001"}]`, true, 5 * time.Minute},
+		{"getBlockReceipts/blockNumber_obj_finalized", "eth_getBlockReceipts", `[{"blockNumber":"0x50"}]`, true, 5 * time.Minute},
+		{"getBlockReceipts/blockNumber_obj_unfinalized", "eth_getBlockReceipts", `[{"blockNumber":"0x96"}]`, true, time.Second},
+
+		// ── Optional block param: omitted → defaults to latest TTL ──
+
+		{"getBalance/omitted", "eth_getBalance", `["0x0000000000000000000000000000000000000001"]`, true, time.Second},
+		{"getTransactionCount/omitted", "eth_getTransactionCount", `["0x0000000000000000000000000000000000000001"]`, true, time.Second},
+		{"getCode/omitted", "eth_getCode", `["0x0000000000000000000000000000000000000001"]`, true, time.Second},
+		{"eth_call/omitted", "eth_call", `[{}]`, true, time.Second},
+		{"getStorageAt/omitted", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0"]`, true, time.Second},
+
+		// ── Required block param missing → no cache ──
+
+		{"getBlockByNumber/no_params", "eth_getBlockByNumber", `[]`, false, 0},
+		{"getBlockTransactionCountByNumber/no_params", "eth_getBlockTransactionCountByNumber", `[]`, false, 0},
+		{"getBlockReceipts/no_params", "eth_getBlockReceipts", `[]`, false, 0},
+		// getTransactionByBlockNumberAndIndex requires blockId at idx 0
+		{"getTransactionByBlockNumberAndIndex/no_params", "eth_getTransactionByBlockNumberAndIndex", `[]`, false, 0},
+
+		// ── Insufficient params for non-optional methods ──
+
+		// eth_getStorageAt paramIdx=2, only 1 param → refNone
+		{"getStorageAt/one_param_only", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001"]`, false, 0},
+		// eth_getBalance with no params at all
+		{"getBalance/no_params", "eth_getBalance", `[]`, false, 0},
+
+		// ── Unknown / write methods → no cache ──
+
+		{"unknown_method", "eth_foo", `[]`, false, 0},
+		{"eth_sendRawTransaction", "eth_sendRawTransaction", `["0xf86c..."]`, false, 0},
+		{"eth_sendTransaction", "eth_sendTransaction", `[{}]`, false, 0},
+		{"eth_estimateGas", "eth_estimateGas", `[{}]`, false, 0},
+		{"eth_getLogs", "eth_getLogs", `[{}]`, false, 0},
+		{"eth_getTransactionByHash", "eth_getTransactionByHash", `["0x0000000000000000000000000000000000000000000000000000000000000001"]`, false, 0},
+		{"eth_getTransactionReceipt", "eth_getTransactionReceipt", `["0x0000000000000000000000000000000000000000000000000000000000000001"]`, false, 0},
+		{"empty_method", "", `[]`, false, 0},
+
+		// ── Spot-check: tags across different methods ──
+
+		{"getBalance/earliest", "eth_getBalance", `["0x0000000000000000000000000000000000000001","earliest"]`, true, 5 * time.Minute},
+		{"getBalance/latest", "eth_getBalance", `["0x0000000000000000000000000000000000000001","latest"]`, true, time.Second},
+		{"getBalance/pending", "eth_getBalance", `["0x0000000000000000000000000000000000000001","pending"]`, false, 0},
+		{"getBalance/safe", "eth_getBalance", `["0x0000000000000000000000000000000000000001","safe"]`, true, 10 * time.Second},
+
+		{"eth_call/earliest", "eth_call", `[{},"earliest"]`, true, 5 * time.Minute},
+		{"eth_call/finalized", "eth_call", `[{},"finalized"]`, true, 5 * time.Minute},
+		{"eth_call/safe", "eth_call", `[{},"safe"]`, true, 10 * time.Second},
+		{"eth_call/latest", "eth_call", `[{},"latest"]`, true, time.Second},
+		{"eth_call/pending", "eth_call", `[{},"pending"]`, false, 0},
+
+		{"getStorageAt/earliest", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0","earliest"]`, true, 5 * time.Minute},
+		{"getStorageAt/latest", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0","latest"]`, true, time.Second},
+
+		{"getBlockTransactionCountByNumber/earliest", "eth_getBlockTransactionCountByNumber", `["earliest"]`, true, 5 * time.Minute},
+		{"getBlockTransactionCountByNumber/latest", "eth_getBlockTransactionCountByNumber", `["latest"]`, true, time.Second},
+
+		{"getTransactionByBlockNumberAndIndex/earliest", "eth_getTransactionByBlockNumberAndIndex", `["earliest","0x0"]`, true, 5 * time.Minute},
+		{"getTransactionByBlockNumberAndIndex/latest", "eth_getTransactionByBlockNumberAndIndex", `["latest","0x0"]`, true, time.Second},
+
+		// ── Spot-check: block numbers across different methods ──
+
+		{"getBalance/finalized_num", "eth_getBalance", `["0x0000000000000000000000000000000000000001","0x50"]`, true, 5 * time.Minute},
+		{"getBalance/unfinalized_num", "eth_getBalance", `["0x0000000000000000000000000000000000000001","0x96"]`, true, time.Second},
+		{"getBalance/future_num", "eth_getBalance", `["0x0000000000000000000000000000000000000001","0xc9"]`, false, 0},
+
+		{"eth_call/finalized_num", "eth_call", `[{},"0x50"]`, true, 5 * time.Minute},
+		{"eth_call/unfinalized_num", "eth_call", `[{},"0x96"]`, true, time.Second},
+		{"eth_call/future_num", "eth_call", `[{},"0xc9"]`, false, 0},
+
+		{"getStorageAt/finalized_num", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0","0x50"]`, true, 5 * time.Minute},
+		{"getStorageAt/unfinalized_num", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0","0x96"]`, true, time.Second},
+
+		// ── EIP-1898 objects across different methods ──
+
+		{"getBalance/blockHash_obj", "eth_getBalance", `["0x0000000000000000000000000000000000000001",{"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000001"}]`, true, 5 * time.Minute},
+		{"getBalance/blockNumber_obj", "eth_getBalance", `["0x0000000000000000000000000000000000000001",{"blockNumber":"0x50"}]`, true, 5 * time.Minute},
+		{"eth_call/blockHash_obj", "eth_call", `[{},{"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000001"}]`, true, 5 * time.Minute},
+		{"eth_call/blockNumber_obj", "eth_call", `[{},{"blockNumber":"0x96"}]`, true, time.Second},
+		{"getStorageAt/blockHash_obj", "eth_getStorageAt", `["0x0000000000000000000000000000000000000001","0x0",{"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000001"}]`, true, 5 * time.Minute},
+
+		// ── Malformed block param → no cache ──
+
+		{"getBlockByNumber/null_blockId", "eth_getBlockByNumber", `[null,true]`, false, 0},
+		{"getBlockByNumber/number_blockId", "eth_getBlockByNumber", `[123,true]`, false, 0},
+		{"getBlockByNumber/invalid_hex", "eth_getBlockByNumber", `["0x",true]`, false, 0},
+		{"getBlockByNumber/bad_obj", "eth_getBlockByNumber", `[{"invalid":"field"},true]`, false, 0},
+		{"getBlockReceipts/empty_obj", "eth_getBlockReceipts", `[{}]`, false, 0},
+
+		// ── JSON edge cases ──
+
+		{"eth_call/escaped_tag", "eth_call", "[{},\"lat\\u0065st\"]", true, time.Second},
+
+		// ── Per-method coverage: tag + block number ──
+
+		{"getCode/latest", "eth_getCode", `["0x0000000000000000000000000000000000000001","latest"]`, true, time.Second},
+		{"getCode/pending", "eth_getCode", `["0x0000000000000000000000000000000000000001","pending"]`, false, 0},
+		{"getCode/finalized_num", "eth_getCode", `["0x0000000000000000000000000000000000000001","0x50"]`, true, 5 * time.Minute},
+
+		{"getTransactionCount/latest", "eth_getTransactionCount", `["0x0000000000000000000000000000000000000001","latest"]`, true, time.Second},
+		{"getTransactionCount/pending", "eth_getTransactionCount", `["0x0000000000000000000000000000000000000001","pending"]`, false, 0},
+		{"getTransactionCount/finalized_num", "eth_getTransactionCount", `["0x0000000000000000000000000000000000000001","0x50"]`, true, 5 * time.Minute},
+
+		{"getBlockReceipts/latest", "eth_getBlockReceipts", `["latest"]`, true, time.Second},
+		{"getBlockReceipts/finalized_num", "eth_getBlockReceipts", `["0x50"]`, true, 5 * time.Minute},
+
+		{"getBlockTransactionCountByNumber/finalized_num", "eth_getBlockTransactionCountByNumber", `["0x50"]`, true, 5 * time.Minute},
+
+		{"getTransactionByBlockNumberAndIndex/finalized_num", "eth_getTransactionByBlockNumberAndIndex", `["0x50","0x0"]`, true, 5 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var params []json.RawMessage
+			if tt.params != "null" {
+				if err := json.Unmarshal([]byte(tt.params), &params); err != nil {
+					t.Fatalf("invalid test params: %v", err)
+				}
+			}
+			gotCache, gotTTL := c.ShouldCache(tt.method, params)
+			if gotCache != tt.wantCache {
+				t.Errorf("ShouldCache(%q, %s).cache = %v; want %v", tt.method, tt.params, gotCache, tt.wantCache)
+			}
+			if gotTTL != tt.wantTTL {
+				t.Errorf("ShouldCache(%q, %s).ttl = %v; want %v", tt.method, tt.params, gotTTL, tt.wantTTL)
+			}
+		})
+	}
 }
 
-func TestShouldCache_FinalizedBlockTag_LongTTL(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_getBlockByNumber with params ["finalized", true]
-	// 期望 shouldCache == true, ttl >= 5 分钟
-}
+func TestShouldCache_FinalizedUnknown(t *testing.T) {
+	c := &redisCache{}
 
-func TestShouldCache_LatestBlockTag_ShortTTL(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_getBlockByNumber with params ["latest", true]
-	// 期望 shouldCache == true, ttl <= 2 秒
-}
+	t.Run("both_unknown", func(t *testing.T) {
+		finalizedBlockNumber.Store(0)
+		latestBlockNumber.Store(0)
+		t.Cleanup(func() {
+			finalizedBlockNumber.Store(0)
+			latestBlockNumber.Store(0)
+		})
 
-func TestShouldCache_PendingBlockTag_NoCache(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_getBlockByNumber with params ["pending", true]
-	// 期望 shouldCache == false
-}
+		tests := []struct {
+			name      string
+			method    string
+			params    string
+			wantCache bool
+			wantTTL   time.Duration
+		}{
+			// Tags still work — they don't depend on finalized block number
+			{"tag_latest", "eth_getBlockByNumber", `["latest",true]`, true, time.Second},
+			{"tag_finalized", "eth_getBlockByNumber", `["finalized",true]`, true, 5 * time.Minute},
+			{"tag_earliest", "eth_getBlockByNumber", `["earliest",true]`, true, 5 * time.Minute},
 
-func TestShouldCache_SpecificBlockNumber_LongTTL(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_getBlockByNumber with params ["0x1234", true]
-	// 期望 shouldCache == true，因为具体区块号的数据不会变
-	// （但未 finalized 的区块可能因 reorg 而改变，如何处理是一个取舍）
-}
+			// Block hash still works — hash commits to content
+			{"blockHash_obj", "eth_getBlockReceipts", `[{"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000001"}]`, true, 5 * time.Minute},
 
-func TestShouldCache_ChainId_LongTTL(t *testing.T) {
-	t.Skip("TODO: implement")
-	// eth_chainId 无参数，结果永远不变
-	// 期望 shouldCache == true, ttl 较长
-}
+			// Static methods still work
+			{"eth_chainId", "eth_chainId", `[]`, true, 5 * time.Minute},
+			{"eth_blockNumber", "eth_blockNumber", `[]`, true, time.Second},
 
-func TestShouldCache_EmptyParams_SafeDefault(t *testing.T) {
-	t.Skip("TODO: implement")
-	// 参数为空或 nil
-	// 期望不 panic，返回安全的默认值
-}
+			// Hex block numbers are NOT cached when finalized is unknown (safety guard)
+			{"block_num_zero", "eth_getBlockByNumber", `["0x0",true]`, false, 0},
+			{"block_num_50", "eth_getBlockByNumber", `["0x50",true]`, false, 0},
+			{"block_num_via_obj", "eth_getBlockReceipts", `[{"blockNumber":"0x50"}]`, false, 0},
+			{"getBalance_block_num", "eth_getBalance", `["0x0000000000000000000000000000000000000001","0x50"]`, false, 0},
 
-func TestShouldCache_UnknownMethod_NoCache(t *testing.T) {
-	t.Skip("TODO: implement")
-	// 未知的方法名
-	// 期望 shouldCache == false
+			// Optional param omitted → defaults to latest tag → still works
+			{"getBalance_omitted", "eth_getBalance", `["0x0000000000000000000000000000000000000001"]`, true, time.Second},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var params []json.RawMessage
+				if err := json.Unmarshal([]byte(tt.params), &params); err != nil {
+					t.Fatalf("invalid test params: %v", err)
+				}
+				gotCache, gotTTL := c.ShouldCache(tt.method, params)
+				if gotCache != tt.wantCache {
+					t.Errorf("ShouldCache(%q, %s).cache = %v; want %v", tt.method, tt.params, gotCache, tt.wantCache)
+				}
+				if gotTTL != tt.wantTTL {
+					t.Errorf("ShouldCache(%q, %s).ttl = %v; want %v", tt.method, tt.params, gotTTL, tt.wantTTL)
+				}
+			})
+		}
+	})
+
+	t.Run("finalized_unknown_latest_known", func(t *testing.T) {
+		finalizedBlockNumber.Store(0)
+		latestBlockNumber.Store(200)
+		t.Cleanup(func() {
+			finalizedBlockNumber.Store(0)
+			latestBlockNumber.Store(0)
+		})
+
+		tests := []struct {
+			name      string
+			method    string
+			params    string
+			wantCache bool
+			wantTTL   time.Duration
+		}{
+			// Block numbers still NOT cached — finalized=0 guard triggers regardless of latest
+			{"block_num_zero", "eth_getBlockByNumber", `["0x0",true]`, false, 0},
+			{"block_num_100", "eth_getBlockByNumber", `["0x64",true]`, false, 0},
+			{"block_num_future", "eth_getBlockByNumber", `["0xc9",true]`, false, 0},
+			{"block_num_via_obj", "eth_getBlockReceipts", `[{"blockNumber":"0x64"}]`, false, 0},
+
+			// Tags still work
+			{"tag_latest", "eth_getBlockByNumber", `["latest",true]`, true, time.Second},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var params []json.RawMessage
+				if err := json.Unmarshal([]byte(tt.params), &params); err != nil {
+					t.Fatalf("invalid test params: %v", err)
+				}
+				gotCache, gotTTL := c.ShouldCache(tt.method, params)
+				if gotCache != tt.wantCache {
+					t.Errorf("ShouldCache(%q, %s).cache = %v; want %v", tt.method, tt.params, gotCache, tt.wantCache)
+				}
+				if gotTTL != tt.wantTTL {
+					t.Errorf("ShouldCache(%q, %s).ttl = %v; want %v", tt.method, tt.params, gotTTL, tt.wantTTL)
+				}
+			})
+		}
+	})
 }
 
 func TestInvalidateOnReorg_ClearsAffectedBlocks(t *testing.T) {
@@ -354,7 +599,7 @@ func TestBuildKey_CaseNormalization(t *testing.T) {
 		{"eth_getTransactionByBlockNumberAndIndex", "blockId", `["0x1a","0x0"]`, `["0x1A","0x0"]`},
 		{"eth_getTransactionByBlockNumberAndIndex", "index", `["0x1a","0xa"]`, `["0x1a","0xA"]`},
 		{"eth_getBlockReceipts", "blockId", `["0x1a"]`, `["0x1A"]`},
-		// hash case: 64-char hex, zeros preserved, only case changes
+		// hash case: 64-char hex, both inputs have identical leading zeros, only case varies
 		{"eth_getBlockByHash", "hash", `["` + hashLower + `",false]`, `["` + hashUpper + `",false]`},
 		{"eth_getBlockTransactionCountByHash", "hash", `["` + hashLower + `"]`, `["` + hashUpper + `"]`},
 		{"eth_getTransactionByBlockHashAndIndex", "hash", `["` + hashLower + `","0x0"]`, `["` + hashUpper + `","0x0"]`},
@@ -405,4 +650,44 @@ func TestBuildKey_WhitespaceNormalization(t *testing.T) {
 	if keyA != keyB {
 		t.Fatalf("whitespace normalization failed:\n  %s → %s\n  %s → %s", compact, keyA, spaced, keyB)
 	}
+}
+
+func TestBuildKey_FieldOrderNormalization(t *testing.T) {
+	const addr1 = "0x0000000000000000000000000000000000000001"
+	const addr2 = "0x0000000000000000000000000000000000000002"
+	const hash1 = "0x0000000000000000000000000000000000000000000000000000000000000001"
+	const hash2 = "0x0000000000000000000000000000000000000000000000000000000000000002"
+
+	t.Run("object_keys_sorted", func(t *testing.T) {
+		tests := []struct {
+			method string
+			name   string
+			a, b   string
+		}{
+			{"eth_call", "txObject_to_data", `[{"to":"` + addr1 + `","data":"0x0001"},"latest"]`, `[{"data":"0x0001","to":"` + addr1 + `"},"latest"]`},
+			{"eth_call", "txObject_value_gas_to", `[{"value":"0x1","gas":"0x5208","to":"` + addr1 + `"},"latest"]`, `[{"to":"` + addr1 + `","value":"0x1","gas":"0x5208"},"latest"]`},
+			{"eth_call", "override_multi_addr", `[{},"latest",{"` + addr1 + `":{"balance":"0x1"},"` + addr2 + `":{"balance":"0x2"}}]`, `[{},"latest",{"` + addr2 + `":{"balance":"0x2"},"` + addr1 + `":{"balance":"0x1"}}]`},
+			{"eth_call", "state_multi_slot", `[{},"latest",{"` + addr1 + `":{"state":{"` + hash1 + `":"0x1","` + hash2 + `":"0x2"}}}]`, `[{},"latest",{"` + addr1 + `":{"state":{"` + hash2 + `":"0x2","` + hash1 + `":"0x1"}}}]`},
+			{"eth_getBalance", "block_obj_reorder", `["` + addr1 + `",{"blockHash":"` + hash1 + `","requireCanonical":true}]`, `["` + addr1 + `",{"requireCanonical":true,"blockHash":"` + hash1 + `"}]`},
+		}
+		for _, tt := range tests {
+			t.Run(tt.method+"/"+tt.name, func(t *testing.T) {
+				keyA := BuildKey(1, tt.method, mustParseParams(t, tt.a))
+				keyB := BuildKey(1, tt.method, mustParseParams(t, tt.b))
+				if keyA != keyB {
+					t.Fatalf("field-order normalization failed:\n  %s → %s\n  %s → %s", tt.a, keyA, tt.b, keyB)
+				}
+			})
+		}
+	})
+
+	t.Run("array_order_preserved", func(t *testing.T) {
+		a := `[{"accessList":[{"address":"` + addr1 + `","storageKeys":[]},{"address":"` + addr2 + `","storageKeys":[]}]},"latest"]`
+		b := `[{"accessList":[{"address":"` + addr2 + `","storageKeys":[]},{"address":"` + addr1 + `","storageKeys":[]}]},"latest"]`
+		keyA := BuildKey(1, "eth_call", mustParseParams(t, a))
+		keyB := BuildKey(1, "eth_call", mustParseParams(t, b))
+		if keyA == keyB {
+			t.Fatalf("array order should be preserved but both produced: %s", keyA)
+		}
+	})
 }

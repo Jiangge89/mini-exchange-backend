@@ -140,23 +140,26 @@ func resolveBlockRef(method toCacheMethod, params []json.RawMessage) blockRef {
 	}
 
 	raw := params[paramIdx]
-	paramVal := bytes.Trim(bytes.TrimSpace(raw), `"`)
 
-	tag := blockParamVal(paramVal)
-	switch tag {
-	case Earliest, Finalized, Safe, Latest, Pending:
-		return blockRef{kind: refTag, tag: tag}
-	}
-
-	s := string(paramVal)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		if n, ok := parseBlockNumber(s); ok {
-			return blockRef{kind: refBlockNum, num: n}
+	var strVal string
+	if err := json.Unmarshal(raw, &strVal); err == nil {
+		tag := blockParamVal(strVal)
+		switch tag {
+		case Earliest, Finalized, Safe, Latest, Pending:
+			return blockRef{kind: refTag, tag: tag}
 		}
+
+		if strings.HasPrefix(strVal, "0x") || strings.HasPrefix(strVal, "0X") {
+			if n, ok := parseBlockNumber(strVal); ok {
+				return blockRef{kind: refBlockNum, num: n}
+			}
+			return blockRef{kind: refNone}
+		}
+
 		return blockRef{kind: refNone}
 	}
 
-	if bytes.HasPrefix(paramVal, []byte("{")) {
+	if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
 		var obj struct {
 			BlockNumber string `json:"blockNumber"`
 			BlockHash   string `json:"blockHash"`
