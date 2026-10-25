@@ -63,8 +63,8 @@ func TestInvalidateOnReorg_ClearsAffectedBlocks(t *testing.T) {
 
 func TestBuildKey_Deterministic(t *testing.T) {
 	params := []json.RawMessage{json.RawMessage(`"latest"`), json.RawMessage(`true`)}
-	key1 := BuildKey("eth_getBlockByNumber", params)
-	key2 := BuildKey("eth_getBlockByNumber", params)
+	key1 := BuildKey(560048, "eth_getBlockByNumber", params)
+	key2 := BuildKey(560048, "eth_getBlockByNumber", params)
 	if key1 != key2 {
 		t.Errorf("BuildKey should be deterministic, got %s and %s", key1, key2)
 	}
@@ -72,8 +72,8 @@ func TestBuildKey_Deterministic(t *testing.T) {
 
 func TestBuildKey_DifferentMethodsDifferentKeys(t *testing.T) {
 	params := []json.RawMessage{json.RawMessage(`"latest"`)}
-	key1 := BuildKey("eth_getBlockByNumber", params)
-	key2 := BuildKey("eth_getBalance", params)
+	key1 := BuildKey(560048, "eth_getBlockByNumber", params)
+	key2 := BuildKey(560048, "eth_getBalance", params)
 	if key1 == key2 {
 		t.Error("different methods should produce different keys")
 	}
